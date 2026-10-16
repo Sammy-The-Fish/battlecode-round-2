@@ -25,10 +25,14 @@ fn random_number(limit: u32) -> u32 {
 }
 
 fn main() -> cambc::Result<()> {
+
     let mut bot = bot::Bot::default();
     loop {
+        // print out draft memory:
+        
         let result = if cambc::is_draft() {
-            draft::play()
+            let result = draft::play();
+            result
         } else {
             bot.play_turn()
         };
@@ -36,5 +40,6 @@ fn main() -> cambc::Result<()> {
             println!("bot error: {error}");
         }
         cambc::end_turn();
+        println!("{:?}", cambc::draft_memory().bytes());
     }
 }

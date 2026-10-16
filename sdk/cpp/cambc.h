@@ -222,7 +222,7 @@ enum class symmetry : std::int32_t
 /// Physical camp types.
 enum class camp_type : std::int32_t
 {
-	/// Wolf camp: 1,350 health, 30 strength; drops gold and gems.
+	/// Wolf camp: 1,350 health, 20 strength; drops gold and gems.
 	wolf,
 	/// Elk camp: 2,400 health, 60 strength; drops more gold and gems than a wolf.
 	elk,
@@ -837,6 +837,15 @@ public:
 		detail::check(detail::sdk_Bitboard_GetSetBits(ptr(), positions.data(), positions.size(), &count));
 		positions.resize(count);
 		return positions;
+	}
+
+	/// Write the positions of set map tiles into `out` and return how many were written.
+	/// @param out Destination buffer; at most `out.size()` positions are written.
+	[[nodiscard]] std::uint32_t positions_into(std::span<vec2> out) const
+	{
+		std::uint32_t count{};
+		detail::check(detail::sdk_Bitboard_GetSetBits(ptr(), out.data(), out.size(), &count));
+		return count;
 	}
 
 	/// Print the buffer through the engine.
@@ -2969,6 +2978,41 @@ namespace map
 class camp_group;
 } // namespace map
 
+/// An individual camp's captured lifecycle. States are mutually exclusive, not flags.
+class camp_state
+{
+public:
+	/// Underlying mutually exclusive engine values; alive means awake.
+	enum class enum_type : std::uint32_t { dead = 0, alive = 1, asleep = 2 };
+	static const camp_state dead;
+	static const camp_state alive;
+	static const camp_state asleep;
+	/// Construct the dead state.
+	constexpr camp_state() noexcept = default;
+	/// Wrap an underlying enum value without changing its identity.
+	constexpr camp_state(enum_type state) noexcept : value_{ state } {}
+	/// Convert to the underlying engine enum.
+	[[nodiscard]] constexpr operator enum_type() const noexcept { return value_; }
+	/// Explicit integer conversion for host ABI values.
+	template <class T> requires std::is_integral_v<T>
+	[[nodiscard]] constexpr explicit operator T() const noexcept { return static_cast<T>(value_); }
+	/// Check whether the captured state is dead.
+	[[nodiscard]] constexpr bool is_dead() const noexcept { return value_ == enum_type::dead; }
+	/// Check whether the captured state is living, including asleep camps.
+	[[nodiscard]] constexpr bool is_alive() const noexcept { return value_ != enum_type::dead; }
+	/// Check whether the captured state is awake (the alive enum value).
+	[[nodiscard]] constexpr bool is_awake() const noexcept { return value_ == enum_type::alive; }
+	/// Check whether the captured state is living but dormant.
+	[[nodiscard]] constexpr bool is_asleep() const noexcept { return value_ == enum_type::asleep; }
+
+private:
+	enum_type value_{};
+};
+
+inline constexpr camp_state camp_state::dead{ enum_type::dead };
+inline constexpr camp_state camp_state::alive{ enum_type::alive };
+inline constexpr camp_state camp_state::asleep{ enum_type::asleep };
+
 /// A runtime camp, with public spawn metadata and visibility-checked combat queries.
 class camp : public unit
 {
@@ -3000,6 +3044,28 @@ public:
 	[[nodiscard]] vec2 spawn_position() const noexcept { return spawn_position_; }
 	/// Query this camp's group from the engine on every call; invalid identities throw.
 	[[nodiscard]] map::camp_group camp_group() const;
+	/// Query dead, alive (awake), or asleep. The current tile, or last occupied tile when dead,
+	/// must be in vision; hidden camps throw api_not_in_vision. This is separate from the camp-group state.
+	[[nodiscard]] camp_state state() const
+	{
+		std::uint32_t value{};
+		detail::check(detail::sdk_camp_state(static_cast<std::uint32_t>(handle_), &value));
+		switch (value)
+		{
+		case 0: return camp_state::dead;
+		case 1: return camp_state::alive;
+		case 2: return camp_state::asleep;
+		default: throw error{ error_code::api_value_out_of_range, "unknown engine camp state" };
+		}
+	}
+	/// Query whether this camp is dead; uses the same visibility checks as state().
+	[[nodiscard]] bool is_dead() const { return state().is_dead(); }
+	/// Query whether this camp is living (awake or asleep); uses the same visibility checks as state().
+	[[nodiscard]] bool is_alive() const { return state().is_alive(); }
+	/// Query whether this camp is awake; uses the same visibility checks as state().
+	[[nodiscard]] bool is_awake() const { return state().is_awake(); }
+	/// Query whether this camp is living but dormant; uses the same visibility checks as state().
+	[[nodiscard]] bool is_asleep() const { return state().is_asleep(); }
 	/// Query current health; live state requires a visible runtime identity.
 	[[nodiscard]] float health() const override { return info().health; }
 	/// Query current maximum health; live state requires a visible runtime identity.
@@ -3083,19 +3149,15 @@ class ability
 	ability(handle_champion_t owner, std::uint32_t slot) : owner_{ static_cast<std::uint32_t>(owner) }, slot_{ slot }
 	{
 		detail::ability_props props{};
-		try
+		const auto code = detail::sdk_champion_ability_props(owner_, slot_, &props);
+		if (code == static_cast<std::int32_t>(error_code::api_not_in_vision))
 		{
-			detail::check(detail::sdk_champion_ability_props(owner_, slot_, &props));
-			if (props.kind == 0)
-				return;
-		}
-		catch (const error& failure)
-		{
-			if (failure.code() != error_code::api_not_in_vision)
-				throw;
-			info_error_ = failure;
+			info_error_ = error{ code };
 			return;
 		}
+		detail::check(code);
+		if (props.kind == 0)
+			return;
 		initialize(props);
 	}
 
@@ -4416,34 +4478,66 @@ namespace detail
 	}
 	return handle_access::make_camp_group(static_cast<handle_camp_group_t>(group), info.gold, info.gems, respawn, std::move(camps));
 }
+
+/// Query every static camp group from the engine in one batched call.
+[[nodiscard]] inline std::vector<map::camp_group> load_camp_groups()
+{
+	std::vector<std::uint32_t> words(256);
+	std::uint32_t count{};
+	check(sdk_map_camp_layout(words.data(), static_cast<std::uint32_t>(words.size()), &count));
+	if (count > words.size())
+	{
+		words.resize(count);
+		check(sdk_map_camp_layout(words.data(), count, &count));
+	}
+	std::vector<map::camp_group> result;
+	for (std::size_t i = 0; i + 5 <= count;)
+	{
+		const auto group = words[i];
+		const auto gold = words[i + 1], gems = words[i + 2];
+		const auto respawn = static_cast<std::int32_t>(words[i + 3]);
+		const auto size = words[i + 4];
+		i += 5;
+		std::vector<cambc::camp> camps;
+		camps.reserve(size);
+		for (std::uint32_t m = 0; m < size && i + 4 <= count; ++m, i += 4)
+			camps.push_back(handle_access::make_camp(static_cast<handle_camp_t>(words[i]), static_cast<handle_camp_group_t>(group),
+				static_cast<camp_type>(words[i + 1]), vec2{ static_cast<std::int32_t>(words[i + 2]), static_cast<std::int32_t>(words[i + 3]) }));
+		result.push_back(handle_access::make_camp_group(static_cast<handle_camp_group_t>(group), gold, gems, respawn, std::move(camps)));
+	}
+	return result;
+}
+
+/// Query one physical camp's spawn info and group from the engine.
+[[nodiscard]] inline cambc::camp load_camp(std::uint32_t handle)
+{
+	camp_info spec{};
+	check(sdk_map_camp_info(handle, &spec));
+	std::uint32_t group{};
+	check(sdk_map_camp_group_of(handle, &group));
+	return handle_access::make_camp(static_cast<handle_camp_t>(handle), static_cast<handle_camp_group_t>(group),
+		static_cast<camp_type>(spec.type), vec2{ spec.x, spec.y });
+}
 } // namespace detail
 
 namespace map
 {
 
-/// Query physical camp groups from the engine on every call; throws in draft.
+/// Query physical camp groups from the engine on every call; also available in draft.
 [[nodiscard]] inline std::vector<camp_group> camp_groups()
 {
-	std::uint32_t count{};
-	detail::check(detail::sdk_map_num_camp_groups(&count));
-	std::vector<std::uint32_t> handles(count);
-	detail::check(detail::sdk_map_camp_groups(handles.data(), count, &count));
-	std::vector<camp_group> result;
-	result.reserve(count);
-	for (std::uint32_t i = 0; i < count; ++i)
-		result.push_back(detail::load_camp_group(handles[i]));
-	return result;
+	return detail::load_camp_groups();
 }
 
 /// Find a camp by spawn tile, querying the engine on every call; throws if there is no camp.
 /// @param position Spawn tile of the camp.
 [[nodiscard]] inline cambc::camp camp(vec2 position)
 {
-	for (const auto& group : camp_groups())
-		for (const auto& member : group)
-			if (member.spawn_position() == position)
-				return member;
-	throw std::out_of_range("no camp on tile");
+	std::uint32_t handle{};
+	const auto code = detail::sdk_map_camp_at(position.x, position.y, &handle);
+	if (code == static_cast<std::int32_t>(error_code::api_not_found)) throw std::out_of_range("no camp on tile");
+	detail::check(code);
+	return detail::load_camp(handle);
 }
 } // namespace map
 
@@ -4630,11 +4724,13 @@ inline void visible_tiles_into(bitboard& out)
 /// @param position Tile to query.
 [[nodiscard]] inline teleport teleport_at(vec2 position)
 {
-	if (has_teleport(position))
-		for (const auto& value : teleports())
-			if (value.position() == position)
-				return value;
-	throw error{ error_code::api_not_found, "no visible teleport at position" };
+	detail::teleport_info value{};
+	const auto code = detail::sdk_teleport_at(position.x, position.y, &value);
+	if (code == static_cast<std::int32_t>(error_code::api_not_in_vision) ||
+		code == static_cast<std::int32_t>(error_code::api_not_found))
+		throw error{ error_code::api_not_found, "no visible teleport at position" };
+	detail::check(code);
+	return teleport{ value };
 }
 
 /// Like `altar_lock_tiles`, but writes into `out` instead of returning a new board.
@@ -4732,11 +4828,7 @@ inline void altar_lock_tiles_into(bitboard& out)
 {
 	std::uint32_t handle{};
 	detail::check(detail::sdk_camp_at(position.x, position.y, &handle));
-	for (const auto& group : map::camp_groups())
-		for (const auto& member : group)
-			if (static_cast<handle_camp_t>(member) == static_cast<handle_camp_t>(handle))
-				return member;
-	throw std::out_of_range("invalid camp handle");
+	return detail::load_camp(handle);
 }
 
 /// Create a fresh view of the currently visible champion at a position.
@@ -5037,6 +5129,36 @@ inline bool champion::move_towards(vec2 target) const
 }
 
 } // namespace cambc
+
+namespace cambc::detail
+{
+#ifdef CAMBC_DEBUG
+/// Fuel pause/resume guard behind the `debug_block` macro.
+struct DebugGuard
+{
+	DebugGuard() { sdk_fuel_pause(); }
+	~DebugGuard() { sdk_fuel_resume(); }
+	DebugGuard(const DebugGuard&) = delete;
+	DebugGuard& operator=(const DebugGuard&) = delete;
+};
+#endif
+} // namespace cambc::detail
+
+/// Run the statements without spending fuel when the bot is built in debug
+/// mode (`cambc run`, the default); skipped entirely in release mode
+/// (`--release`, and always on the platform). The free budget per block is
+/// 1000 turns, beyond which the rest of the block is charged; ending the
+/// turn inside a block closes the free window.
+/// A macro: the code runs inline — `break`/`continue` apply to the enclosing
+/// loop, `return` leaves the enclosing function and fuel resumes on the way
+/// out. In release mode the code is type-checked but never evaluated. Call
+/// it unqualified (`debug_block({ ... });`), not as `cambc::debug_block`,
+/// and use no preprocessor directives inside.
+#ifdef CAMBC_DEBUG
+#define debug_block(...) if (::cambc::detail::DebugGuard _cambc_debug_guard{}; true) { __VA_ARGS__ } else (void)0
+#else
+#define debug_block(...) if (false) { __VA_ARGS__ } else (void)0
+#endif
 
 /// Hashes both coordinates; consistent with vec2 equality.
 template <>
