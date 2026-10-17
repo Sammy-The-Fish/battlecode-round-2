@@ -1,5 +1,30 @@
 // Champion decisions. main.rs dispatches here after the draft.
-use cambc::{Bitboard, Champion, DistanceField, ItemType as Item, Result, Team, Unit, Vec2};
+use cambc::{Bitboard, Champion, ChampionType, DistanceField, ItemType as Item, Result, Team, Unit, Vec2};
+
+enum CharacterTypes {Ranged, Assassin, Mage, Bruiser, Support}
+
+
+fn get_character_class(champion : &Champion) -> CharacterTypes
+{
+    let Ok(name) = champion.champion_name() 
+    else {
+        panic!();
+    };
+    match name{
+        ChampionType::Cassi => CharacterTypes::Ranged,
+        ChampionType::Issac => CharacterTypes::Assassin,
+        ChampionType::Ryth => CharacterTypes::Bruiser,
+        ChampionType::VesperVale => CharacterTypes::Ranged,
+        ChampionType::Prism => CharacterTypes::Mage,
+        ChampionType::Stellar => CharacterTypes::Mage,
+        ChampionType::Vendetta => CharacterTypes::Assassin,
+        ChampionType::Marcella => CharacterTypes::Bruiser,
+        ChampionType::Tavi => CharacterTypes::Ranged,
+        ChampionType::Willow => CharacterTypes::Support,
+        ChampionType::Ren => CharacterTypes::Assassin, //could techically also be a bruiser if he wanted so idk 
+        ChampionType::Varg => CharacterTypes::Bruiser
+    }
+}
 
 fn me() -> Result<&'static Champion> {
     Ok(cambc::self_champion()?.expect("play starts after the draft"))
