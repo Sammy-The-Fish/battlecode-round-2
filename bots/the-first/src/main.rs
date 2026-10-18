@@ -49,6 +49,5 @@ fn main() -> cambc::Result<()> {
             println!("bot error: {error}");
         }
         cambc::end_turn();
-        println!("{:?}", &cambc::draft_memory().bytes()[0..10]);
     }
 }
